@@ -6,7 +6,7 @@ use core::mem;
 
 use crate::{
     Align, Attrs, AttrsList, Cached, Ellipsize, FontSystem, Hinting, LayoutLine, LayoutRunIter,
-    LineEnding, ShapeLine, Shaping, Wrap,
+    LineEdit, LineEnding, ShapeLine, Shaping, Wrap,
 };
 
 /// A line (or paragraph) of text that is shaped and laid out
@@ -20,6 +20,10 @@ pub struct BufferLine {
     layout_opt: Cached<Vec<LayoutLine>>,
     shaping: Shaping,
     metadata: Option<usize>,
+    /// How the text changed since the shaping held unused in `shape_opt`
+    /// was made, when only the text changed: the next [`Self::shape`] keeps
+    /// the words the change left alone.
+    edit: Option<LineEdit>,
 }
 
 impl BufferLine {
@@ -41,6 +45,7 @@ impl BufferLine {
             layout_opt: Cached::Empty,
             shaping,
             metadata: None,
+            edit: None,
         }
     }
 
@@ -62,6 +67,7 @@ impl BufferLine {
         self.layout_opt.set_unused();
         self.shaping = shaping;
         self.metadata = None;
+        self.edit = None;
     }
 
     /// Get current text
@@ -73,6 +79,10 @@ impl BufferLine {
     ///
     /// Will reset shape and layout if it differs from current text and attributes list.
     /// Returns true if the line was reset
+    ///
+    /// When only the text changed, and the attributes list has no spans, the
+    /// next [`Self::shape`] shapes only the words the change touched: see
+    /// [`ShapeLine::rebuild_edited`].
     pub fn set_text<T: AsRef<str>>(
         &mut self,
         text: T,
@@ -81,11 +91,19 @@ impl BufferLine {
     ) -> bool {
         let text = text.as_ref();
         if text != self.text || ending != self.ending || attrs_list != self.attrs_list {
+            let shaped_before = self.shape_opt.is_used() || self.edit.is_some();
+            let edit =
+                (shaped_before && attrs_list == self.attrs_list && attrs_list.spans.is_empty())
+                    .then(|| {
+                        let edit = LineEdit::between(&self.text, text);
+                        self.edit.map_or(edit, |before| before.then(edit))
+                    });
             self.text.clear();
             self.text.push_str(text);
             self.ending = ending;
             self.attrs_list = attrs_list;
             self.reset();
+            self.edit = edit;
             true
         } else {
             false
@@ -201,6 +219,7 @@ impl BufferLine {
 
     /// Reset shaping and layout caches
     pub fn reset_shaping(&mut self) {
+        self.edit = None;
         self.shape_opt.set_unused();
         self.reset_layout();
     }
@@ -214,17 +233,31 @@ impl BufferLine {
     #[allow(clippy::missing_panics_doc)]
     pub fn shape(&mut self, font_system: &mut FontSystem, tab_width: u16) -> &ShapeLine {
         if self.shape_opt.is_unused() {
-            let mut line = self
-                .shape_opt
-                .take_unused()
-                .unwrap_or_else(ShapeLine::empty);
-            line.build(
-                font_system,
-                &self.text,
-                &self.attrs_list,
-                self.shaping,
-                tab_width,
-            );
+            let unused = self.shape_opt.take_unused();
+            let line = match (unused, self.edit.take()) {
+                (Some(mut line), Some(edit)) => {
+                    line.rebuild_edited(
+                        font_system,
+                        &self.text,
+                        &self.attrs_list,
+                        self.shaping,
+                        tab_width,
+                        edit,
+                    );
+                    line
+                }
+                (unused, _) => {
+                    let mut line = unused.unwrap_or_else(ShapeLine::empty);
+                    line.build(
+                        font_system,
+                        &self.text,
+                        &self.attrs_list,
+                        self.shaping,
+                        tab_width,
+                    );
+                    line
+                }
+            };
             self.shape_opt.set_used(line);
             self.layout_opt.set_unused();
         }
@@ -310,6 +343,7 @@ impl BufferLine {
             layout_opt: Cached::Empty,
             shaping: Shaping::Advanced,
             metadata: None,
+            edit: None,
         }
     }
 

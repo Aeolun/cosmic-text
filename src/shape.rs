@@ -19,6 +19,10 @@ use core::ops::Range;
 
 #[cfg(not(feature = "std"))]
 use core_maths::CoreFloat;
+
+#[cfg(test)]
+#[path = "shape_edit_tests.rs"]
+mod edit_tests;
 use fontdb::Style;
 use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
@@ -101,6 +105,9 @@ pub struct ShapeBuffer {
 
     /// Buffer for shape words.
     words: Vec<ShapeWord>,
+
+    /// Buffer for the words of a line being shaped again after an edit.
+    reused_words: Vec<OldWord>,
 
     /// Buffers for visual lines.
     visual_lines: Vec<VisualLine>,
@@ -806,6 +813,9 @@ impl ShapeWord {
     ) {
         let word = &line[word_range.clone()];
 
+        #[cfg(test)]
+        edit_tests::WORDS_SHAPED.with(|count| count.set(count.get() + 1));
+
         log::trace!(
             "      Word{}: '{}'",
             if blank { " BLANK" } else { "" },
@@ -946,6 +956,31 @@ impl ShapeSpan {
         level: unicode_bidi::Level,
         shaping: Shaping,
     ) {
+        self.build_with(
+            font_system,
+            line,
+            attrs_list,
+            span_range,
+            line_rtl,
+            level,
+            shaping,
+            None,
+        );
+    }
+
+    /// [`Self::build`], taking each word from `reuse` when it holds that word
+    /// shaped before an edit.
+    fn build_with(
+        &mut self,
+        font_system: &mut FontSystem,
+        line: &str,
+        attrs_list: &AttrsList,
+        span_range: Range<usize>,
+        line_rtl: bool,
+        level: unicode_bidi::Level,
+        shaping: Shaping,
+        mut reuse: Option<&mut WordReuse>,
+    ) {
         let span = &line[span_range.start..span_range.end];
 
         log::trace!(
@@ -1048,32 +1083,30 @@ impl ShapeSpan {
                 }
             }
             if start_word < start_lb {
-                let mut word = cached_words.pop().unwrap_or_else(ShapeWord::empty);
-                word.build(
-                    font_system,
-                    line,
-                    attrs_list,
-                    (span_range.start + start_word)..(span_range.start + start_lb),
-                    level,
-                    false,
-                    shaping,
-                );
+                let range = (span_range.start + start_word)..(span_range.start + start_lb);
+                let reused = reuse
+                    .as_deref_mut()
+                    .and_then(|reuse| reuse.take(line, &range, level, false));
+                let word = reused.unwrap_or_else(|| {
+                    let mut word = cached_words.pop().unwrap_or_else(ShapeWord::empty);
+                    word.build(font_system, line, attrs_list, range, level, false, shaping);
+                    word
+                });
                 words.push(word);
             }
             if start_lb < end_lb {
                 for (i, c) in span[start_lb..end_lb].char_indices() {
                     // assert!(c.is_whitespace());
-                    let mut word = cached_words.pop().unwrap_or_else(ShapeWord::empty);
-                    word.build(
-                        font_system,
-                        line,
-                        attrs_list,
-                        (span_range.start + start_lb + i)
-                            ..(span_range.start + start_lb + i + c.len_utf8()),
-                        level,
-                        true,
-                        shaping,
-                    );
+                    let range = (span_range.start + start_lb + i)
+                        ..(span_range.start + start_lb + i + c.len_utf8());
+                    let reused = reuse
+                        .as_deref_mut()
+                        .and_then(|reuse| reuse.take(line, &range, level, true));
+                    let word = reused.unwrap_or_else(|| {
+                        let mut word = cached_words.pop().unwrap_or_else(ShapeWord::empty);
+                        word.build(font_system, line, attrs_list, range, level, true, shaping);
+                        word
+                    });
                     words.push(word);
                 }
             }
@@ -1185,6 +1218,128 @@ impl ShapeSpan {
 
         // Cache buffer for future reuse.
         font_system.shape_buffer.words = cached_words;
+    }
+}
+
+/// Where an edit changed a line's text: the first `prefix` bytes and the last
+/// `suffix` bytes are the same before and after it, and the text was `old_len`
+/// bytes long before it. See [`ShapeLine::rebuild_edited`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineEdit {
+    pub prefix: usize,
+    pub suffix: usize,
+    pub old_len: usize,
+}
+
+impl LineEdit {
+    /// The edit that turns `old` into `new`: their common prefix, and their
+    /// common suffix within what the prefix leaves of the shorter.
+    pub fn between(old: &str, new: &str) -> Self {
+        let (old_bytes, new_bytes) = (old.as_bytes(), new.as_bytes());
+        let prefix = old_bytes
+            .iter()
+            .zip(new_bytes)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let room = min(old.len(), new.len()) - prefix;
+        let suffix = old_bytes[prefix..]
+            .iter()
+            .rev()
+            .zip(new_bytes[prefix..].iter().rev())
+            .take(room)
+            .take_while(|(a, b)| a == b)
+            .count();
+        Self {
+            prefix,
+            suffix,
+            old_len: old.len(),
+        }
+    }
+
+    /// This edit and then `next`, as one edit from the text before this one.
+    #[must_use]
+    pub fn then(self, next: Self) -> Self {
+        Self {
+            prefix: min(self.prefix, next.prefix),
+            suffix: min(self.suffix, next.suffix),
+            old_len: self.old_len,
+        }
+    }
+}
+
+/// A word shaped before an edit, with its bytes in the text before the edit.
+#[derive(Debug)]
+struct OldWord {
+    range: Range<usize>,
+    level: unicode_bidi::Level,
+    word: ShapeWord,
+}
+
+/// The words of a line shaped before an edit, in logical order, handed out
+/// while the line is shaped again: [`ShapeLine::rebuild_edited`].
+struct WordReuse {
+    words: Vec<OldWord>,
+    /// The first word not yet passed over; words are asked for in logical
+    /// order, so the search only moves forward.
+    next: usize,
+    edit: LineEdit,
+    new_len: usize,
+    /// The direction of the line the words came from; in a right-to-left
+    /// line each word's glyphs were reversed.
+    line_rtl: bool,
+    ellipsis_span: Option<ShapeSpan>,
+}
+
+impl WordReuse {
+    /// The word shaped before the edit for bytes `range` of the new `line`,
+    /// when the edit left those bytes alone and the old line had a word just
+    /// there, at `level` and as `blank`: its glyphs moved to the new bytes,
+    /// in logical order.
+    fn take(
+        &mut self,
+        line: &str,
+        range: &Range<usize>,
+        level: unicode_bidi::Level,
+        blank: bool,
+    ) -> Option<ShapeWord> {
+        let suffix_start = self.new_len - self.edit.suffix;
+        let old = if range.end <= self.edit.prefix {
+            range.clone()
+        } else if range.start >= suffix_start {
+            // Adding before subtracting: the bytes are in the suffix, so
+            // neither side goes below zero.
+            (range.start + self.edit.old_len - self.new_len)
+                ..(range.end + self.edit.old_len - self.new_len)
+        } else {
+            return None;
+        };
+        while self
+            .words
+            .get(self.next)
+            .is_some_and(|word| word.range.start < old.start)
+        {
+            self.next += 1;
+        }
+        let candidate = self.words.get_mut(self.next)?;
+        if candidate.range != old
+            || candidate.level != level
+            || candidate.word.blank != blank
+            || line[range.clone()].contains('\t')
+        {
+            return None;
+        }
+        self.next += 1;
+        let mut word = mem::replace(&mut candidate.word, ShapeWord::empty());
+        if old.start != range.start {
+            for glyph in &mut word.glyphs {
+                glyph.start = glyph.start + self.new_len - self.edit.old_len;
+                glyph.end = glyph.end + self.new_len - self.edit.old_len;
+            }
+        }
+        if self.line_rtl {
+            word.glyphs.reverse();
+        }
+        Some(word)
     }
 }
 
@@ -1333,6 +1488,84 @@ impl ShapeLine {
         shaping: Shaping,
         tab_width: u16,
     ) {
+        self.build_with(font_system, line, attrs_list, shaping, tab_width, None);
+    }
+
+    /// Shape `line` again after `edit` changed it, keeping the words this line
+    /// holds (shaped from the text before the edit) that lie wholly outside
+    /// the changed bytes and are split, levelled and blank as before, and
+    /// shaping only the rest.
+    ///
+    /// `self` must hold the shaping of the text before the edit, made with the
+    /// same `attrs_list`, `shaping` and fonts, and `attrs_list` must have no
+    /// spans (its defaults apply to the whole line), so a word's glyphs
+    /// depend only on its own text and level. A tab's advance depends on
+    /// where it falls, so a word holding a tab is always shaped again. When
+    /// the line's direction changed, every word is shaped again.
+    ///
+    /// The result is the same as [`Self::build`] on the new text.
+    pub fn rebuild_edited(
+        &mut self,
+        font_system: &mut FontSystem,
+        line: &str,
+        attrs_list: &AttrsList,
+        shaping: Shaping,
+        tab_width: u16,
+        edit: LineEdit,
+    ) {
+        debug_assert!(attrs_list.spans.is_empty());
+        let mut words = mem::take(&mut font_system.shape_buffer.reused_words);
+        words.clear();
+        for span in &mut self.spans {
+            let level = span.level;
+            let mut keep = |word: ShapeWord| {
+                let start = word.glyphs.iter().map(|glyph| glyph.start).min();
+                let end = word.glyphs.iter().map(|glyph| glyph.end).max();
+                if let (Some(start), Some(end)) = (start, end) {
+                    words.push(OldWord {
+                        range: start..end,
+                        level,
+                        word,
+                    });
+                }
+            };
+            // Back into logical order: the words of a span against the
+            // line's direction were reversed.
+            if self.rtl == level.is_rtl() {
+                span.words.drain(..).for_each(&mut keep);
+            } else {
+                span.words.drain(..).rev().for_each(&mut keep);
+            }
+        }
+        let mut reuse = WordReuse {
+            words,
+            next: 0,
+            edit,
+            new_len: line.len(),
+            line_rtl: self.rtl,
+            ellipsis_span: self.ellipsis_span.take(),
+        };
+        self.build_with(
+            font_system,
+            line,
+            attrs_list,
+            shaping,
+            tab_width,
+            Some(&mut reuse),
+        );
+        reuse.words.clear();
+        font_system.shape_buffer.reused_words = reuse.words;
+    }
+
+    fn build_with(
+        &mut self,
+        font_system: &mut FontSystem,
+        line: &str,
+        attrs_list: &AttrsList,
+        shaping: Shaping,
+        tab_width: u16,
+        reuse: Option<&mut WordReuse>,
+    ) {
         // Clear stale ellipsis span so it gets recomputed with the current attrs.
         // Without this, reusing a ShapeLine from a previous text (via Cached::Unused)
         // would keep an ellipsis shaped with the old attrs.
@@ -1353,6 +1586,13 @@ impl ShapeLine {
         };
 
         log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
+
+        // Words and the ellipsis shaped before an edit keep only when the
+        // line still runs the same way.
+        let mut reuse = reuse.filter(|reuse| reuse.line_rtl == rtl);
+        if let Some(reuse) = reuse.as_deref_mut() {
+            self.ellipsis_span = reuse.ellipsis_span.take();
+        }
 
         for para_info in &bidi.paragraphs {
             let line_rtl = para_info.level.is_rtl();
@@ -1376,7 +1616,7 @@ impl ShapeLine {
                 if new_level != run_level {
                     // End of the previous run, start of a new one.
                     let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
-                    span.build(
+                    span.build_with(
                         font_system,
                         line,
                         attrs_list,
@@ -1384,6 +1624,7 @@ impl ShapeLine {
                         line_rtl,
                         run_level,
                         shaping,
+                        reuse.as_deref_mut(),
                     );
                     spans.push(span);
                     start = i;
@@ -1391,7 +1632,7 @@ impl ShapeLine {
                 }
             }
             let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
-            span.build(
+            span.build_with(
                 font_system,
                 line,
                 attrs_list,
@@ -1399,6 +1640,7 @@ impl ShapeLine {
                 line_rtl,
                 run_level,
                 shaping,
+                reuse.as_deref_mut(),
             );
             spans.push(span);
         }
