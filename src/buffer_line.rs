@@ -4,10 +4,23 @@
 use alloc::{string::String, vec::Vec};
 use core::mem;
 
+use crate::shape::{LineStart, WordsKept};
 use crate::{
     Align, Attrs, AttrsList, Cached, Ellipsize, FontSystem, Hinting, LayoutLine, LayoutRunIter,
     LineEdit, LineEnding, ShapeLine, Shaping, Wrap,
 };
+
+/// What a line was laid out with, besides its shaping.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LayoutArgs {
+    font_size: f32,
+    width_opt: Option<f32>,
+    wrap: Wrap,
+    ellipsize: Ellipsize,
+    align: Option<Align>,
+    match_mono_width: Option<f32>,
+    hinting: Hinting,
+}
 
 /// A line (or paragraph) of text that is shaped and laid out
 #[derive(Clone, Debug)]
@@ -24,6 +37,16 @@ pub struct BufferLine {
     /// was made, when only the text changed: the next [`Self::shape`] keeps
     /// the words the change left alone.
     edit: Option<LineEdit>,
+    /// What the layout held in `layout_opt` (used or not) was laid out
+    /// with, while it was laid out from the shaping held in `shape_opt` or,
+    /// with `relayout` set, the one before it.
+    layout_args: Option<LayoutArgs>,
+    /// The word and glyph each line of that layout starts at, when the
+    /// shaping was uniform; see `ShapeLine::relayout_edited`.
+    layout_starts: Vec<LineStart>,
+    /// Which words the shaping in `shape_opt` kept from the one the layout
+    /// was made from, when it was shaped again after an edit since.
+    relayout: Option<WordsKept>,
 }
 
 impl BufferLine {
@@ -46,6 +69,9 @@ impl BufferLine {
             shaping,
             metadata: None,
             edit: None,
+            layout_args: None,
+            layout_starts: Vec::new(),
+            relayout: None,
         }
     }
 
@@ -236,7 +262,7 @@ impl BufferLine {
             let unused = self.shape_opt.take_unused();
             let line = match (unused, self.edit.take()) {
                 (Some(mut line), Some(edit)) => {
-                    line.rebuild_edited(
+                    let kept = line.rebuild_edited_kept(
                         font_system,
                         &self.text,
                         &self.attrs_list,
@@ -244,9 +270,19 @@ impl BufferLine {
                         tab_width,
                         edit,
                     );
+                    // The layout can follow one edit; after two without a
+                    // layout between, it is laid out whole.
+                    if self.relayout.is_none() && kept.is_some() && self.layout_args.is_some() {
+                        self.relayout = kept;
+                    } else {
+                        self.relayout = None;
+                        self.layout_args = None;
+                    }
                     line
                 }
                 (unused, _) => {
+                    self.relayout = None;
+                    self.layout_args = None;
                     let mut line = unused.unwrap_or_else(ShapeLine::empty);
                     line.build(
                         font_system,
@@ -288,22 +324,55 @@ impl BufferLine {
     ) -> &[LayoutLine] {
         if self.layout_opt.is_unused() {
             let align = self.align;
-            let mut layout = self
-                .layout_opt
-                .take_unused()
-                .unwrap_or_else(|| Vec::with_capacity(1));
-            let shape = self.shape(font_system, tab_width);
-            shape.layout_to_buffer(
-                &mut font_system.shape_buffer,
+            let args = LayoutArgs {
                 font_size,
                 width_opt,
                 wrap,
                 ellipsize,
                 align,
-                &mut layout,
                 match_mono_width,
                 hinting,
-            );
+            };
+            let mut layout = self
+                .layout_opt
+                .take_unused()
+                .unwrap_or_else(|| Vec::with_capacity(1));
+            self.shape(font_system, tab_width);
+            let shape = self.shape_opt.get().expect("shape not found");
+            let relaid = self
+                .relayout
+                .take()
+                .filter(|_| self.layout_args == Some(args))
+                .is_some_and(|kept| {
+                    shape.relayout_edited(
+                        &mut font_system.shape_buffer,
+                        font_size,
+                        width_opt,
+                        wrap,
+                        ellipsize,
+                        align,
+                        &mut layout,
+                        match_mono_width,
+                        hinting,
+                        &mut self.layout_starts,
+                        kept,
+                    )
+                });
+            if !relaid {
+                shape.layout_to_buffer_traced(
+                    &mut font_system.shape_buffer,
+                    font_size,
+                    width_opt,
+                    wrap,
+                    ellipsize,
+                    align,
+                    &mut layout,
+                    match_mono_width,
+                    hinting,
+                    &mut self.layout_starts,
+                );
+            }
+            self.layout_args = Some(args);
             self.layout_opt.set_used(layout);
         }
         self.layout_opt.get().expect("layout not found")
@@ -344,6 +413,9 @@ impl BufferLine {
             shaping: Shaping::Advanced,
             metadata: None,
             edit: None,
+            layout_args: None,
+            layout_starts: Vec::new(),
+            relayout: None,
         }
     }
 

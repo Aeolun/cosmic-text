@@ -1267,10 +1267,32 @@ impl LineEdit {
     }
 }
 
-/// A word shaped before an edit, with its bytes in the text before the edit.
+/// Which words of a line shaped again after an edit are the words it had
+/// before, in logical order (`ShapeLine::rebuild_edited_kept`): the first
+/// `head` words are the old ones at the same indices, and from new word
+/// `tail` on, new word `i` is old word `i + word_shift`, moved by `byte_shift`
+/// bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WordsKept {
+    pub(crate) head: usize,
+    pub(crate) tail: usize,
+    pub(crate) word_shift: isize,
+    pub(crate) byte_shift: isize,
+}
+
+/// Where a laid out line starts, and whether wrapping from there with nothing
+/// before it makes the same lines: see `ShapeLine::relayout_edited`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineStart {
+    at: WordGlyphPos,
+    fresh: bool,
+}
+
+/// A word shaped before an edit, with its bytes in the text before the edit
+/// (`None` for a word with no glyphs, which is never handed out).
 #[derive(Debug)]
 struct OldWord {
-    range: Range<usize>,
+    range: Option<Range<usize>>,
     level: unicode_bidi::Level,
     word: ShapeWord,
 }
@@ -1288,6 +1310,18 @@ struct WordReuse {
     /// line each word's glyphs were reversed.
     line_rtl: bool,
     ellipsis_span: Option<ShapeSpan>,
+    /// The line before the edit was plain (`ShapeLine::plain`).
+    plain: bool,
+    /// The words were not offered because the line's direction changed.
+    dropped: bool,
+    /// How many new words have been asked for: the index of the next one.
+    asked: usize,
+    /// How many new words from the first are the old ones at the same index.
+    head: usize,
+    /// The run of new words, ending at the last one asked for, that are old
+    /// words all at one index offset: where it starts, and the offset.
+    run_start: usize,
+    run_shift: Option<isize>,
 }
 
 impl WordReuse {
@@ -1302,6 +1336,36 @@ impl WordReuse {
         level: unicode_bidi::Level,
         blank: bool,
     ) -> Option<ShapeWord> {
+        let index = self.asked;
+        self.asked += 1;
+        let taken = self.take_at(line, range, level, blank);
+        match &taken {
+            Some((old_index, _)) => {
+                if self.head == index && *old_index == index {
+                    self.head += 1;
+                }
+                let shift = *old_index as isize - index as isize;
+                if self.run_shift != Some(shift) {
+                    self.run_start = index;
+                    self.run_shift = Some(shift);
+                }
+            }
+            None => {
+                self.run_start = index + 1;
+                self.run_shift = None;
+            }
+        }
+        taken.map(|(_, word)| word)
+    }
+
+    /// What [`Self::take`] hands out, with the old word's index.
+    fn take_at(
+        &mut self,
+        line: &str,
+        range: &Range<usize>,
+        level: unicode_bidi::Level,
+        blank: bool,
+    ) -> Option<(usize, ShapeWord)> {
         let suffix_start = self.new_len - self.edit.suffix;
         let old = if range.end <= self.edit.prefix {
             range.clone()
@@ -1313,21 +1377,22 @@ impl WordReuse {
         } else {
             return None;
         };
-        while self
-            .words
-            .get(self.next)
-            .is_some_and(|word| word.range.start < old.start)
-        {
+        while self.words.get(self.next).is_some_and(|word| {
+            word.range
+                .as_ref()
+                .is_none_or(|range| range.start < old.start)
+        }) {
             self.next += 1;
         }
         let candidate = self.words.get_mut(self.next)?;
-        if candidate.range != old
+        if candidate.range.as_ref() != Some(&old)
             || candidate.level != level
             || candidate.word.blank != blank
             || line[range.clone()].contains('\t')
         {
             return None;
         }
+        let old_index = self.next;
         self.next += 1;
         let mut word = mem::replace(&mut candidate.word, ShapeWord::empty());
         if old.start != range.start {
@@ -1339,7 +1404,46 @@ impl WordReuse {
         if self.line_rtl {
             word.glyphs.reverse();
         }
-        Some(word)
+        Some((old_index, word))
+    }
+
+    /// Whether the new `line` is plain (`ShapeLine::plain`) for having been
+    /// plain before the edit and gaining no directional character from it.
+    fn stays_plain(&self, line: &str) -> bool {
+        if !self.plain {
+            return false;
+        }
+        let mut start = self.edit.prefix;
+        while !line.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = self.new_len - self.edit.suffix;
+        while !line.is_char_boundary(end) {
+            end += 1;
+        }
+        !line[start..end]
+            .chars()
+            .any(|c| directional(unicode_bidi::bidi_class(c)))
+    }
+
+    /// Which words the new line kept, once every new word was asked for;
+    /// `None` when the words were not offered.
+    fn kept(&self) -> Option<WordsKept> {
+        if self.dropped {
+            return None;
+        }
+        let tail_shift = self.words.len() as isize - self.asked as isize;
+        let tail = if self.run_shift == Some(tail_shift) {
+            self.run_start
+        } else {
+            self.asked
+        };
+        Some(WordsKept {
+            head: self.head,
+            tail,
+            word_shift: tail_shift,
+            byte_shift: self.new_len as isize - self.edit.old_len as isize,
+        })
     }
 }
 
@@ -1350,10 +1454,25 @@ pub struct ShapeLine {
     pub spans: Vec<ShapeSpan>,
     pub metrics_opt: Option<Metrics>,
     ellipsis_span: Option<ShapeSpan>,
+    /// The text holds no character that can make it anything but one
+    /// left-to-right paragraph ([`directional`]), so an edit that adds none
+    /// leaves it one: [`Self::rebuild_edited`] skips the bidi analysis.
+    plain: bool,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct WordGlyphPos {
+/// Whether a character of bidi class `class` can raise a level, change a
+/// paragraph's direction or end a paragraph. Text with none of them is one
+/// left-to-right paragraph at level 0.
+fn directional(class: unicode_bidi::BidiClass) -> bool {
+    use unicode_bidi::BidiClass::{AL, AN, B, FSI, LRE, LRI, LRO, PDF, PDI, R, RLE, RLI, RLO};
+    matches!(
+        class,
+        R | AL | AN | B | LRE | RLE | LRO | RLO | PDF | LRI | RLI | FSI | PDI
+    )
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WordGlyphPos {
     word: usize,
     glyph: usize,
 }
@@ -1430,10 +1549,15 @@ struct VisualLine {
     /// Byte range (start, end) of the original line text that was replaced by the ellipsis.
     /// Only set when `ellipsized` is true.
     elided_byte_range: Option<(usize, usize)>,
+    /// The line starts partway through laying out a word split across lines
+    /// by glyph, so wrapping from its start with nothing before it would not
+    /// make it: see `ShapeLine::relayout_edited`.
+    continues_word: bool,
 }
 
 impl VisualLine {
     fn clear(&mut self) {
+        self.continues_word = false;
         self.ranges.clear();
         self.spaces = 0;
         self.w = 0.;
@@ -1452,6 +1576,7 @@ impl ShapeLine {
             spans: Vec::default(),
             metrics_opt: None,
             ellipsis_span: None,
+            plain: false,
         }
     }
 
@@ -1513,6 +1638,20 @@ impl ShapeLine {
         tab_width: u16,
         edit: LineEdit,
     ) {
+        self.rebuild_edited_kept(font_system, line, attrs_list, shaping, tab_width, edit);
+    }
+
+    /// [`Self::rebuild_edited`], saying which words it kept, so the layout of
+    /// the old words can be kept where it still holds.
+    pub(crate) fn rebuild_edited_kept(
+        &mut self,
+        font_system: &mut FontSystem,
+        line: &str,
+        attrs_list: &AttrsList,
+        shaping: Shaping,
+        tab_width: u16,
+        edit: LineEdit,
+    ) -> Option<WordsKept> {
         debug_assert!(attrs_list.spans.is_empty());
         let mut words = mem::take(&mut font_system.shape_buffer.reused_words);
         words.clear();
@@ -1521,13 +1660,11 @@ impl ShapeLine {
             let mut keep = |word: ShapeWord| {
                 let start = word.glyphs.iter().map(|glyph| glyph.start).min();
                 let end = word.glyphs.iter().map(|glyph| glyph.end).max();
-                if let (Some(start), Some(end)) = (start, end) {
-                    words.push(OldWord {
-                        range: start..end,
-                        level,
-                        word,
-                    });
-                }
+                words.push(OldWord {
+                    range: start.zip(end).map(|(start, end)| start..end),
+                    level,
+                    word,
+                });
             };
             // Back into logical order: the words of a span against the
             // line's direction were reversed.
@@ -1544,6 +1681,12 @@ impl ShapeLine {
             new_len: line.len(),
             line_rtl: self.rtl,
             ellipsis_span: self.ellipsis_span.take(),
+            plain: self.plain,
+            dropped: false,
+            asked: 0,
+            head: 0,
+            run_start: 0,
+            run_shift: None,
         };
         self.build_with(
             font_system,
@@ -1553,8 +1696,10 @@ impl ShapeLine {
             tab_width,
             Some(&mut reuse),
         );
+        let kept = reuse.kept();
         reuse.words.clear();
         font_system.shape_buffer.reused_words = reuse.words;
+        kept
     }
 
     fn build_with(
@@ -1578,28 +1723,43 @@ impl ShapeLine {
         cached_spans.clear();
         cached_spans.extend(spans.drain(..).rev());
 
-        let bidi = unicode_bidi::BidiInfo::new(line, None);
-        let rtl = if bidi.paragraphs.is_empty() {
-            false
-        } else {
-            bidi.paragraphs[0].level.is_rtl()
-        };
+        // A plain line edited plainly is one left-to-right paragraph at level
+        // 0; any other is analysed.
+        let stays_plain = reuse
+            .as_deref()
+            .is_some_and(|reuse| reuse.stays_plain(line));
+        let bidi = (!stays_plain).then(|| unicode_bidi::BidiInfo::new(line, None));
+        let rtl = bidi
+            .as_ref()
+            .and_then(|bidi| bidi.paragraphs.first())
+            .is_some_and(|paragraph| paragraph.level.is_rtl());
+        self.plain = bidi.as_ref().is_none_or(|bidi| {
+            !bidi
+                .original_classes
+                .iter()
+                .any(|&class| directional(class))
+        });
+        let paragraphs = bidi.as_ref().map_or(&[][..], |bidi| &bidi.paragraphs[..]);
 
         log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
 
         // Words and the ellipsis shaped before an edit keep only when the
         // line still runs the same way.
-        let mut reuse = reuse.filter(|reuse| reuse.line_rtl == rtl);
+        let mut reuse = reuse.and_then(|reuse| {
+            reuse.dropped = reuse.line_rtl != rtl;
+            (!reuse.dropped).then_some(reuse)
+        });
         if let Some(reuse) = reuse.as_deref_mut() {
             self.ellipsis_span = reuse.ellipsis_span.take();
         }
 
-        for para_info in &bidi.paragraphs {
+        for para_info in paragraphs {
             let line_rtl = para_info.level.is_rtl();
             assert_eq!(line_rtl, rtl);
 
+            let bidi = bidi.as_ref().expect("paragraphs come from the analysis");
             let line_range = para_info.range.clone();
-            let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info));
+            let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(bidi, para_info));
 
             // Find consecutive level runs. We use this to create Spans.
             // Each span is a set of characters with equal levels.
@@ -1644,10 +1804,29 @@ impl ShapeLine {
             );
             spans.push(span);
         }
+        if stays_plain && !line.is_empty() {
+            let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+            span.build_with(
+                font_system,
+                line,
+                attrs_list,
+                0..line.len(),
+                false,
+                unicode_bidi::Level::ltr(),
+                shaping,
+                reuse,
+            );
+            spans.push(span);
+        }
 
-        // Adjust for tabs
+        // Adjust for tabs (a pass over every glyph, so only when there are any)
         let mut x = 0.0;
-        for span in &mut spans {
+        let tabs = if line.contains('\t') {
+            &mut spans[..]
+        } else {
+            &mut [][..]
+        };
+        for span in tabs {
             for word in &mut span.words {
                 for glyph in &mut word.glyphs {
                     if line.get(glyph.start..glyph.end) == Some("\t") {
@@ -2530,6 +2709,204 @@ impl ShapeLine {
         match_mono_width: Option<f32>,
         hinting: Hinting,
     ) {
+        self.layout_words(
+            scratch,
+            font_size,
+            width_opt,
+            wrap,
+            ellipsize,
+            align,
+            layout_lines,
+            match_mono_width,
+            hinting,
+            None,
+            true,
+        );
+    }
+
+    /// Whether the line is one span at its paragraph's level, so its words
+    /// are laid out in logical order, each visual line one range of them.
+    fn is_uniform(&self) -> bool {
+        matches!(self.spans.as_slice(), [span] if span.level.number() == u8::from(self.rtl))
+    }
+
+    /// The word and glyph each line [`Self::layout_words`] just laid out
+    /// starts at, read from the visual lines it left in `scratch`.
+    fn read_starts(scratch: &ShapeBuffer, starts: &mut Vec<LineStart>) {
+        starts.extend(scratch.visual_lines.iter().filter_map(|line| {
+            line.ranges.first().map(|range| LineStart {
+                at: range.start,
+                fresh: range.start.glyph == 0 && !line.continues_word,
+            })
+        }));
+    }
+
+    /// [`Self::layout_to_buffer`], recording in `starts` the word and glyph
+    /// each laid out line starts at when the line is uniform
+    /// ([`Self::is_uniform`]), and clearing it when not, for
+    /// [`Self::relayout_edited`] after the next edit.
+    pub(crate) fn layout_to_buffer_traced(
+        &self,
+        scratch: &mut ShapeBuffer,
+        font_size: f32,
+        width_opt: Option<f32>,
+        wrap: Wrap,
+        ellipsize: Ellipsize,
+        align: Option<Align>,
+        layout_lines: &mut Vec<LayoutLine>,
+        match_mono_width: Option<f32>,
+        hinting: Hinting,
+        starts: &mut Vec<LineStart>,
+    ) {
+        self.layout_to_buffer(
+            scratch,
+            font_size,
+            width_opt,
+            wrap,
+            ellipsize,
+            align,
+            layout_lines,
+            match_mono_width,
+            hinting,
+        );
+        starts.clear();
+        if self.is_uniform() {
+            Self::read_starts(scratch, starts);
+        }
+    }
+
+    /// Lay out this line, shaped again after an edit (`kept`), by changing
+    /// `layout_lines`, its layout from before the edit, only where the edit
+    /// moved the wrapping: [`Self::layout_to_buffer_traced`]'s result, from a
+    /// fraction of the work for an edit to a long line.
+    ///
+    /// The lines before the last one starting at a word the edit kept at its
+    /// index stand; wrapping starts again there, as it would with nothing
+    /// before it, over a window of words, and stops at the first new line
+    /// that starts a word of the kept tail where an old line started that
+    /// word: from there on every line is the old one, its glyphs moved by the
+    /// bytes the edit added. The window doubles until that happens or it
+    /// reaches the end of the line.
+    ///
+    /// Returns false, changing nothing, when the line or the layout is not
+    /// one this applies to: not uniform, not wrapped, ellipsized, with no
+    /// finite width, or without starts recorded for every old line.
+    /// `layout_lines` and `starts` must come from the shaping before the edit,
+    /// laid out with the same arguments.
+    pub(crate) fn relayout_edited(
+        &self,
+        scratch: &mut ShapeBuffer,
+        font_size: f32,
+        width_opt: Option<f32>,
+        wrap: Wrap,
+        ellipsize: Ellipsize,
+        align: Option<Align>,
+        layout_lines: &mut Vec<LayoutLine>,
+        match_mono_width: Option<f32>,
+        hinting: Hinting,
+        starts: &mut Vec<LineStart>,
+        kept: WordsKept,
+    ) -> bool {
+        if !self.is_uniform()
+            || wrap == Wrap::None
+            || ellipsize != Ellipsize::None
+            || !width_opt.is_some_and(f32::is_finite)
+            || starts.len() != layout_lines.len()
+            || starts.first().map(|start| start.at) != Some(WordGlyphPos::ZERO)
+        {
+            return false;
+        }
+        let count = self.spans[0].words.len();
+        let restart = starts
+            .iter()
+            .rposition(|start| start.fresh && start.at.word < kept.head)
+            .unwrap_or(0);
+        let from = starts[restart].at.word;
+        let mut window = Vec::new();
+        let mut window_starts = Vec::new();
+        let mut end = count.min(kept.tail.max(from) + 16);
+        loop {
+            self.layout_words(
+                scratch,
+                font_size,
+                width_opt,
+                wrap,
+                ellipsize,
+                align,
+                &mut window,
+                match_mono_width,
+                hinting,
+                Some(from..end),
+                end == count,
+            );
+            window_starts.clear();
+            Self::read_starts(scratch, &mut window_starts);
+            if window_starts.len() != window.len() {
+                return false;
+            }
+            // The window's last line may lack words past its end, but where
+            // it starts is settled, so every line's start counts.
+            let join = window_starts
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(new, start)| {
+                    if !start.fresh || start.at.word < kept.tail {
+                        return None;
+                    }
+                    let old =
+                        WordGlyphPos::new((start.at.word as isize + kept.word_shift) as usize, 0);
+                    starts
+                        .binary_search_by(|start| start.at.cmp(&old))
+                        .ok()
+                        .filter(|&old| starts[old].fresh)
+                        .map(|old| (new, old))
+                });
+            match join {
+                Some((new, old)) => {
+                    layout_lines.splice(restart..old, window.drain(..new));
+                    for line in &mut layout_lines[restart + new..] {
+                        for glyph in &mut line.glyphs {
+                            glyph.start = (glyph.start as isize + kept.byte_shift) as usize;
+                            glyph.end = (glyph.end as isize + kept.byte_shift) as usize;
+                        }
+                    }
+                    starts.splice(restart..old, window_starts.drain(..new));
+                    for start in &mut starts[restart + new..] {
+                        start.at.word = (start.at.word as isize - kept.word_shift) as usize;
+                    }
+                    return true;
+                }
+                None if end == count => {
+                    layout_lines.splice(restart.., window.drain(..));
+                    starts.splice(restart.., window_starts.drain(..));
+                    return true;
+                }
+                None => end = count.min(from + 2 * (end - from)),
+            }
+        }
+    }
+
+    /// [`Self::layout_to_buffer`], over the words `words` of a uniform line's
+    /// span ([`Self::is_uniform`]) when given, wrapping from the first as if
+    /// nothing came before it; `paragraph_end` says whether the last of them
+    /// ends the paragraph, so its last line is not justified.
+    fn layout_words(
+        &self,
+        scratch: &mut ShapeBuffer,
+        font_size: f32,
+        width_opt: Option<f32>,
+        wrap: Wrap,
+        ellipsize: Ellipsize,
+        align: Option<Align>,
+        layout_lines: &mut Vec<LayoutLine>,
+        match_mono_width: Option<f32>,
+        hinting: Hinting,
+        words: Option<Range<usize>>,
+        paragraph_end: bool,
+    ) {
+        debug_assert!(words.is_none() || self.is_uniform());
+        let words = words.unwrap_or(0..usize::MAX);
         // For each visual line a list of  (span index,  and range of words in that span)
         // Note that a BiDi visual line could have multiple spans or parts of them
         // let mut vl_range_of_spans = Vec::with_capacity(1);
@@ -2714,6 +3091,7 @@ impl ShapeLine {
                                         number_of_blanks = 0;
                                         word_range_width = glyph_width;
                                         fitting_start = WordGlyphPos::new(i, glyph_i + 1);
+                                        current_visual_line.continues_word = true;
                                         total_line_count += 1;
                                         total_line_height += line_height;
                                         if try_ellipsize_last_line(
@@ -2815,8 +3193,11 @@ impl ShapeLine {
                         );
                     } else {
                         // congruent direction
-                        let mut fitting_start = WordGlyphPos::ZERO;
-                        for (i, word) in span.words.iter().enumerate() {
+                        let span_end = words.end.min(span.words.len());
+                        let span_start = words.start.min(span_end);
+                        let mut fitting_start = WordGlyphPos::new(span_start, 0);
+                        for (i, word) in span.words[..span_end].iter().enumerate().skip(span_start)
+                        {
                             let word_width = word.width(font_size);
                             if current_visual_line.w + (word_range_width + word_width)
                             <= width_opt.unwrap_or(f32::INFINITY)
@@ -2897,6 +3278,7 @@ impl ShapeLine {
                                         number_of_blanks = 0;
                                         word_range_width = glyph_width;
                                         fitting_start = WordGlyphPos::new(i, glyph_i);
+                                        current_visual_line.continues_word = true;
                                         total_line_count += 1;
                                         total_line_height += line_height;
                                         if try_ellipsize_last_line(
@@ -2986,7 +3368,7 @@ impl ShapeLine {
                             &mut current_visual_line,
                             span_index,
                             fitting_start,
-                            WordGlyphPos::new(span.words.len(), 0),
+                            WordGlyphPos::new(span_end, 0),
                             word_range_width,
                             number_of_blanks,
                         );
@@ -3068,7 +3450,7 @@ impl ShapeLine {
             let justification_expansion = if matches!(align, Align::Justified)
                 && visual_line.spaces > 0
                 // Don't justify the last line in a paragraph.
-                && index != number_of_visual_lines - 1
+                && (index != number_of_visual_lines - 1 || !paragraph_end)
             {
                 (line_width - visual_line.w) / visual_line.spaces as f32
             } else {
@@ -3264,6 +3646,8 @@ impl ShapeLine {
                 }
             }
 
+            #[cfg(test)]
+            edit_tests::LINES_LAID_OUT.with(|count| count.set(count.get() + 1));
             layout_lines.push(LayoutLine {
                 w: if align != Align::Justified {
                     visual_line.w
