@@ -1657,9 +1657,29 @@ impl ShapeLine {
         words.clear();
         for span in &mut self.spans {
             let level = span.level;
+            let rtl = self.rtl;
             let mut keep = |word: ShapeWord| {
-                let start = word.glyphs.iter().map(|glyph| glyph.start).min();
-                let end = word.glyphs.iter().map(|glyph| glyph.end).max();
+                let (start, end) = if !rtl && !level.is_rtl() {
+                    // Left-to-right glyphs are in logical order (clusters
+                    // only rise), so the ends hold the word's bytes.
+                    (
+                        word.glyphs.first().map(|glyph| glyph.start),
+                        word.glyphs.last().map(|glyph| glyph.end),
+                    )
+                } else {
+                    (
+                        word.glyphs.iter().map(|glyph| glyph.start).min(),
+                        word.glyphs.iter().map(|glyph| glyph.end).max(),
+                    )
+                };
+                debug_assert_eq!(
+                    start.zip(end),
+                    word.glyphs
+                        .iter()
+                        .map(|glyph| glyph.start)
+                        .min()
+                        .zip(word.glyphs.iter().map(|glyph| glyph.end).max())
+                );
                 words.push(OldWord {
                     range: start.zip(end).map(|(start, end)| start..end),
                     level,
